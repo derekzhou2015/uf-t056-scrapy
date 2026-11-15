@@ -646,3 +646,45 @@ class TestMediaFailedFailure(TestBaseMediaPipeline):
             "request_errback",
             "item_completed",
         ]
+
+
+class MediaDownloadedFailurePipeline(MockedMediaPipeline):
+    """A pipeline whose media_downloaded() raises a content-validation error."""
+
+    def media_downloaded(
+        self,
+        response: Response,
+        request: Request,
+        info: MediaPipeline.SpiderInfo,
+        *,
+        item: Any = None,
+    ) -> FileInfo | Awaitable[FileInfo]:
+        self._mockcalled.append("media_downloaded")
+        raise ValueError("invalid content")
+
+
+class TestMediaDownloadedFailure(TestBaseMediaPipeline):
+    """Exceptions raised by media_downloaded() (content-validation failures)
+    are not download errors: they must bypass media_failed() and reach
+    item_completed() unmodified."""
+
+    pipeline_class = MediaDownloadedFailurePipeline
+
+    @coroutine_test
+    async def test_media_failed_not_called(self):
+        self.pipe.LOG_FAILED_RESULTS = False
+        req = Request("http://url1", meta={"response": Response("http://url1")})
+        new_item = await self.pipe.process_item({"requests": req})
+        assert len(new_item["results"]) == 1
+        ok, value = new_item["results"][0]
+        assert ok is False
+        assert isinstance(value, Failure)
+        # the original exception is preserved, not replaced by media_failed()
+        assert isinstance(value.value, ValueError)
+        assert str(value.value) == "invalid content"
+        assert self.mocked_pipe._mockcalled == [
+            "get_media_requests",
+            "media_to_download",
+            "media_downloaded",
+            "item_completed",
+        ]

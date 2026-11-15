@@ -689,6 +689,113 @@ class TestFilesPipeline:
             for r in caplog.records
         )
 
+    @coroutine_test
+    async def test_process_item_invalid_status_not_a_download_error(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A non-2xx response is a content-validation failure: it is logged
+        once as such, never as an unknown download error, and it does not go
+        through the media_failed() hook."""
+        item_url = "http://example.com/missing.pdf"
+        item = _create_item_with_files(item_url)
+        request = _prepare_request_object(item_url, status=404)
+        with (
+            caplog.at_level(logging.WARNING),
+            mock.patch.object(
+                FilesPipeline, "get_media_requests", return_value=[request]
+            ),
+            mock.patch.object(
+                FilesPipeline,
+                "media_failed",
+                autospec=True,
+                side_effect=FilesPipeline.media_failed,
+            ) as media_failed_mock,
+        ):
+            result = await self.pipeline.process_item(item)
+
+        assert result["files"] == []
+        media_failed_mock.assert_not_called()
+        code_records = [
+            r for r in caplog.records if "File (code: 404)" in r.getMessage()
+        ]
+        assert len(code_records) == 1
+        assert code_records[0].levelname == "WARNING"
+        assert not any("unknown-error" in r.getMessage() for r in caplog.records)
+
+    @coroutine_test
+    async def test_process_item_download_error(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A network/transport failure goes through media_failed() and is
+        logged as a download error, not as a content-validation one."""
+        item_url = "http://example.com/file.pdf"
+        item = _create_item_with_files(item_url)
+        request = Request(item_url, meta={"response": Exception("boom")})
+        with (
+            caplog.at_level(logging.WARNING),
+            mock.patch.object(
+                FilesPipeline, "get_media_requests", return_value=[request]
+            ),
+            mock.patch.object(
+                FilesPipeline,
+                "media_failed",
+                autospec=True,
+                side_effect=FilesPipeline.media_failed,
+            ) as media_failed_mock,
+        ):
+            result = await self.pipeline.process_item(item)
+
+        assert result["files"] == []
+        media_failed_mock.assert_called_once()
+        unknown_records = [
+            r for r in caplog.records if "unknown-error" in r.getMessage()
+        ]
+        assert len(unknown_records) == 1
+        assert unknown_records[0].levelname == "WARNING"
+        assert not any("File (code:" in r.getMessage() for r in caplog.records)
+
+    @coroutine_test
+    async def test_failed_download_response_accessible(self) -> None:
+        """The documented pattern of attaching the response to a custom
+        FileException in media_downloaded() makes the response available in
+        item_completed()."""
+
+        class ResponseFileException(FileException):
+            def __init__(self, response):
+                super().__init__(f"download-error ({response.status})")
+                self.response = response
+
+        class MyFilesPipeline(FilesPipeline):
+            async def media_downloaded(self, response, request, info, *, item=None):
+                try:
+                    return await super().media_downloaded(
+                        response, request, info, item=item
+                    )
+                except FileException:
+                    raise ResponseFileException(response)
+
+            def item_completed(self, results, item, info):
+                errors = [
+                    value.value.response.status
+                    for ok, value in results
+                    if not ok and value.check(ResponseFileException)
+                ]
+                if errors:
+                    item["download_errors"] = errors
+                return super().item_completed(results, item, info)
+
+        item_url = "http://example.com/missing.pdf"
+        item = {"file_urls": [item_url]}
+        pipeline = self._create_pipeline(MyFilesPipeline)
+        request = _prepare_request_object(item_url, status=404)
+        with mock.patch.object(
+            FilesPipeline, "get_media_requests", return_value=[request]
+        ):
+            result = await pipeline.process_item(item)
+
+        assert result["download_errors"] == [404]
+        assert result["files"] == []
+
     @pytest.mark.parametrize(
         "bad_type",
         [
